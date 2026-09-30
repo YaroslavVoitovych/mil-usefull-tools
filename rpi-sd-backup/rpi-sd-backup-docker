@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# rpi-sd-backup-docker — запуск rpi-sd-backup у Docker-контейнері (хост: macOS або Linux).
+#
+# Docker Desktop не має доступу до блокових пристроїв хоста, тому картка читається на хості
+# (dd, за потреби через sudo) і передається в контейнер потоком через stdin; у контейнері
+# відбувається хешування, стиснення xz і звірка. Результат пишеться у примонтовану теку.
+# Файли-образи (verify/inspect/restore) монтуються в контейнер лише для читання.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+IMAGE="${RPI_SD_BACKUP_IMAGE:-rpi-sd-backup:local}"
+
+# підключаємо головний скрипт як бібліотеку: log/warn/die, dev_*, human, dd_bs ...
+# shellcheck source=rpi-sd-backup
+RPI_SD_BACKUP_LIB=1 . "$HERE/rpi-sd-backup"
+
+usage() {
+  cat <<EOF
+rpi-sd-backup-docker — те саме, що rpi-sd-backup, але робота виконується в контейнері $IMAGE.
+
+Використання:
+  rpi-sd-backup-docker build                                зібрати образ контейнера
+  rpi-sd-backup-docker list                                 знімні диски на хості
+  rpi-sd-backup-docker backup  <disk|file.img> [опції]      бекап -> NAME.img.xz (+ sha256, звірка)
+  rpi-sd-backup-docker verify  <file.img.xz> [raw.sha256]   перевірити архів
+  rpi-sd-backup-docker inspect <file.img>                   стан ext4, cloud-init, cmdline.txt
+  rpi-sd-backup-docker restore <file.img[.xz]> <disk>       записати образ на картку
+
+Опції backup: -o DIR  -n NAME  -l N  -T N  --raw  --no-verify  --force   (як у rpi-sd-backup)
+Змінна RPI_SD_BACKUP_IMAGE перевизначає ім'я образу (типово $IMAGE).
+EOF
+}
+
+ensure_docker() {
+  command -v docker >/dev/null 2>&1 || die "потрібен Docker (docker.com)"
+  docker info >/dev/null 2>&1 || die "Docker-демон не запущений"
+}
+cmd_build() { ensure_docker; log "docker build -t $IMAGE $HERE"; docker build -t "$IMAGE" "$HERE"; }
+ensure_image() { ensure_docker; docker image inspect "$IMAGE" >/dev/null 2>&1 || cmd_build; }
+abs_dir() { cd "$(dirname "$1")" && pwd; }
+as_user() { echo "$(id -u):$(id -g)"; }
+
+# ---------- backup ----------
+cmd_backup_docker() {
+  local src="" outdir="." name="" pass=() force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o|--out) outdir="$2"; shift 2 ;;
+      -n|--name) name="$2"; shift 2 ;;
+      -l|--level|-T|--threads) pass+=("$1" "$2"); shift 2 ;;
+      --raw|--no-verify) pass+=("$1"); shift ;;
+      --force) force=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "невідома опція: $1" ;;
+      *) [ -z "$src" ] || die "зайвий аргумент: $1"; src="$1"; shift ;;
+    esac
+  done
+  [ -n "$src" ] || { usage; die "вкажіть диск (див. list) або файл .img"; }
+  ensure_image
+  mkdir -p "$outdir"
+  local outabs; outabs=$(cd "$outdir" && pwd)
+
+  if [ -f "$src" ]; then
+    local inabs; inabs=$(abs_dir "$src")
+    [ "$inabs" != "$outabs" ] || true
+    log "Джерело — файл $src; читаю його в контейнері"
+    docker run --rm --user "$(as_user)" \
+      -v "$inabs:/in:ro" -v "$outabs:/out" "$IMAGE" \
+      backup "/in/$(basename "$src")" -o /out ${name:+-n "$name"} ${pass[@]+"${pass[@]}"}
+    return
+  fi
+
+  local dev rawdev size SUDO
+  dev=$(dev_norm "$src"); rawdev=$(dev_raw "$dev")
+  guard_target_disk "$dev" "$force"
+  size=$(dev_size "$dev")
+  [ -n "$size" ] && [ "$size" -gt 0 ] || die "не вдалося визначити розмір $dev"
+  [ -n "$name" ] || name="rpi-sd-${dev##*/}-$(date +%Y%m%d-%H%M)"
+  [ ! -e "$outabs/$name.img.xz" ] || die "файл уже існує: $outabs/$name.img.xz"
+
+  log "Джерело: $dev ($(dev_proto "$dev"), $size байт, $(human "$size"))"
+  dev_partitions "$dev" >&2
+  log "Відмонтовую розділи $dev"
+  dev_unmount "$dev"
+  SUDO=$(sudo_if_needed "$rawdev")
+  [ -z "$SUDO" ] || { log "Для читання $rawdev потрібен sudo"; sudo -v; }
+
+  log "Хост: dd $rawdev -> контейнер: sha256 + xz -> $outabs/$name.img.xz"
+  # shellcheck disable=SC2086
+  $SUDO dd if="$rawdev" bs="$(dd_bs)" \
+    | docker run --rm -i --user "$(as_user)" -v "$outabs:/out" "$IMAGE" \
+        backup --stdin --size "$size" -o /out -n "$name" ${pass[@]+"${pass[@]}"}
+  echo "Диск $dev відмонтовано, його можна витягнути." >&2
+}
+
+# ---------- verify / inspect ----------
+cmd_verify_docker() {
+  local file="${1:-}" rawsha="${2:-}"
+  [ -n "$file" ] || die "вкажіть файл .img.xz"
+  [ -f "$file" ] || die "немає файлу: $file"
+  ensure_image
+  local inabs; inabs=$(abs_dir "$file")
+  local extra=()
+  if [ -n "$rawsha" ]; then
+    if [ -f "$rawsha" ]; then
+      [ "$(abs_dir "$rawsha")" = "$inabs" ] || die "файл sha256 має лежати поруч з архівом (одна тека)"
+      extra=("/in/$(basename "$rawsha")")
+    else
+      extra=("$rawsha")
+    fi
+  fi
+  docker run --rm --user "$(as_user)" -v "$inabs:/in:ro" "$IMAGE" verify "/in/$(basename "$file")" ${extra[@]+"${extra[@]}"}
+}
+cmd_inspect_docker() {
+  local file="${1:-}"
+  [ -n "$file" ] || die "вкажіть сирий .img"
+  [ -f "$file" ] || die "немає файлу: $file"
+  ensure_image
+  docker run --rm --user "$(as_user)" -v "$(abs_dir "$file"):/in:ro" "$IMAGE" inspect "/in/$(basename "$file")"
+}
+
+# ---------- restore ----------
+cmd_restore_docker() {
+  local file="" disk="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "невідома опція: $1" ;;
+      *) if [ -z "$file" ]; then file="$1"; elif [ -z "$disk" ]; then disk="$1"; else die "зайвий аргумент: $1"; fi; shift ;;
+    esac
+  done
+  [ -n "$file" ] && [ -n "$disk" ] || die "використання: rpi-sd-backup-docker restore <file.img[.xz]> <disk>"
+  [ -f "$file" ] || die "немає файлу: $file"
+  ensure_image
+
+  local dev rawdev size unc SUDO
+  dev=$(dev_norm "$disk"); rawdev=$(dev_raw "$dev")
+  guard_target_disk "$dev" "$force"
+  size=$(dev_size "$dev")
+  case "$file" in
+    *.xz) unc=$(docker run --rm -v "$(abs_dir "$file"):/in:ro" --entrypoint xz "$IMAGE" --robot -l "/in/$(basename "$file")" | awk -F'\t' '$1=="file"{print $5}') ;;
+    *) unc=$(fsize "$file") ;;
+  esac
+  [ "$unc" -le "$size" ] || die "образ ($unc байт) більший за диск $dev ($size байт)"
+
+  log "ЦІЛЬ: $dev ($(dev_proto "$dev"), $(human "$size")). УСІ ДАНІ НА НЬОМУ БУДЕ ЗНИЩЕНО."
+  dev_partitions "$dev" >&2
+  printf 'Для підтвердження введіть ідентифікатор диска (%s): ' "${dev##*/}" >&2
+  local answer; read -r answer
+  [ "$answer" = "${dev##*/}" ] || die "скасовано"
+
+  dev_unmount "$dev"
+  SUDO=$(sudo_if_needed "$rawdev"); [ -z "$SUDO" ] || sudo -v
+  log "Контейнер: розпакування -> хост: dd -> $rawdev"
+  # shellcheck disable=SC2086
+  docker run --rm -v "$(abs_dir "$file"):/in:ro" "$IMAGE" restore --stdout "/in/$(basename "$file")" \
+    | $SUDO dd of="$rawdev" bs="$(dd_bs)" $(dd_progress_flag)
+  sync
+  dev_eject "$dev"
+  echo "Готово. На більшій картці root-розділ розшириться сам (cloud-init) або: sudo growpart /dev/mmcblk0 2 && sudo resize2fs /dev/mmcblk0p2" >&2
+}
+
+main_docker() {
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    build) cmd_build ;;
+    list) cmd_list ;;
+    backup) cmd_backup_docker "$@" ;;
+    verify) cmd_verify_docker "$@" ;;
+    inspect) cmd_inspect_docker "$@" ;;
+    restore) cmd_restore_docker "$@" ;;
+    -V|--version) echo "rpi-sd-backup-docker $VERSION (image: $IMAGE)" ;;
+    ""|-h|--help|help) usage ;;
+    *) usage; die "невідома команда: $cmd" ;;
+  esac
+}
+
+main_docker "$@"

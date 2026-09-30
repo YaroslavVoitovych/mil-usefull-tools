@@ -1,0 +1,555 @@
+#!/usr/bin/env bash
+# rpi-sd-backup — повний бекап SD-картки Raspberry Pi одним файлом (.img.xz),
+# готовим для Raspberry Pi Imager.
+#
+# Працює нативно на macOS (diskutil) і Linux (lsblk), сумісно з bash 3.2.
+# Той самий скрипт є entrypoint у Docker-образі: там картка надходить потоком
+# через stdin (backup --stdin --size N), а образ для restore віддається в stdout.
+#
+# Потік даних під час backup:
+#   джерело (dd /dev/rdiskN | dd /dev/sdX | файл | stdin)
+#      └─> tee ──> xz -T0 > NAME.img.xz      (архів)
+#             ├─> >(sha256)                  (хеш сирого потоку)
+#             └─> NAME.img                   (лише з --raw)
+# Після цього перевіряється, що нестиснутий розмір архіву == розмір джерела,
+# і (якщо не --no-verify) що sha256 розпакованого архіву == хеш сирого потоку.
+set -euo pipefail
+
+VERSION="1.1.0"
+OS=$(uname -s)   # Darwin | Linux
+
+# ---------- службові ----------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "потрібна утиліта '$1'${2:+ ($2)}"; }
+
+usage() {
+  cat <<'EOF'
+rpi-sd-backup — бекап SD-картки Raspberry Pi одним файлом (.img.xz) для Raspberry Pi Imager.
+Нативно: macOS / Linux. У Docker: див. rpi-sd-backup-docker.
+
+Використання:
+  rpi-sd-backup list                                       знімні диски (кандидати на SD-картку)
+  rpi-sd-backup backup  <disk|file.img> [опції]            повний образ -> NAME.img.xz (+ sha256, звірка)
+  rpi-sd-backup backup  --stdin --size BYTES [опції]       те саме, але джерело — stdin (режим Docker)
+  rpi-sd-backup verify  <file.img.xz> [raw.sha256|hex]     перевірити архів: xz -t, sha256 архіву, sha256 розпакованого
+  rpi-sd-backup inspect <file.img>                         стан ext4, cloud-init, cmdline.txt у сирому образі
+  rpi-sd-backup restore <file.img[.xz]> <disk>             записати образ на картку через dd (альтернатива Imager)
+  rpi-sd-backup restore --stdout <file.img[.xz]>           віддати розпакований образ у stdout (режим Docker)
+
+<disk>: macOS — disk5 / /dev/disk5; Linux — sdb / /dev/sdb / mmcblk0 (цілий диск, не розділ).
+
+Опції backup:
+  -o, --out DIR        тека для результату (типово: поточна)
+  -n, --name NAME      базове ім'я файлу (типово: rpi-sd-<disk>-<YYYYmmdd-HHMM>)
+  -l, --level N        рівень стиснення xz 0..9 (типово 6)
+  -T, --threads N      потоки xz (типово 0 = усі ядра)
+      --raw            додатково зберегти нестиснутий NAME.img
+      --no-verify      не розпаковувати архів для звірки sha256
+      --force          не вимагати, щоб диск був знімним (SD/USB)
+      --stdin          читати сирий потік зі stdin (разом із --size BYTES для перевірки повноти)
+      --size BYTES     очікуваний розмір потоку для --stdin
+
+Опції restore:
+      --force          не вимагати, щоб диск був знімним (SD/USB)
+      --stdout         не писати на диск, а віддати розпакований потік у stdout
+
+Загальні: -h, --help    -V, --version
+
+Приклади:
+  rpi-sd-backup list
+  rpi-sd-backup backup disk5 -o ~/rpi-backup -n rpi5-ubuntu-user-desktop      # macOS
+  sudo rpi-sd-backup backup /dev/sdb -o ~/rpi-backup                           # Linux
+  rpi-sd-backup verify ~/rpi-backup/rpi5-ubuntu-user-desktop.img.xz
+  rpi-sd-backup inspect ~/rpi-backup/rpi5-ubuntu-user-desktop.img
+EOF
+}
+
+# ---------- платформа ----------
+sha256_stream() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
+sha256_hex() { sha256_stream | awk '{print $1}'; }
+fsize() { if [ "$OS" = Darwin ]; then stat -f %z "$1"; else stat -c %s "$1"; fi; }
+dd_bs() { if [ "$OS" = Darwin ]; then echo 4m; else echo 4M; fi; }
+dd_progress_flag() {
+  if dd if=/dev/zero of=/dev/null count=0 status=progress >/dev/null 2>&1; then echo "status=progress"; fi
+}
+human() {
+  awk -v b="$1" 'BEGIN{ split("B KiB MiB GiB TiB",u," "); i=1; while (b>=1024 && i<5){b/=1024;i++}; printf "%.2f %s", b, u[i] }'
+}
+sudo_if_needed() {  # $1=шлях; друкує "sudo" якщо файл не читається
+  [ -r "$1" ] || { command -v sudo >/dev/null 2>&1 || die "$1 не читається, а sudo немає"; echo "sudo"; }
+}
+
+# --- пристрої: нормалізація до шляху цілого диска ---
+dev_norm() {
+  local a="$1" d
+  if [ "$OS" = Darwin ]; then
+    d="${a##*/}"; d="${d#r}"
+    [[ "$d" =~ ^disk[0-9]+$ ]] || die "невірний ідентифікатор диска: $a (очікую diskN)"
+    [ -e "/dev/$d" ] || die "/dev/$d не існує"
+    echo "/dev/$d"
+  else
+    d="${a#/dev/}"
+    [ -b "/dev/$d" ] || die "/dev/$d не є блоковим пристроєм"
+    [ "$(lsblk -dno TYPE "/dev/$d" 2>/dev/null)" = "disk" ] || die "/dev/$d не є цілим диском (вкажіть sdX або mmcblkN, не розділ)"
+    echo "/dev/$d"
+  fi
+}
+dev_raw() { if [ "$OS" = Darwin ]; then echo "/dev/r${1#/dev/}"; else echo "$1"; fi; }
+mac_field() { diskutil info "$1" | sed -nE "s/^ *$2: +//p" | head -1; }
+dev_size() {
+  if [ "$OS" = Darwin ]; then diskutil info "$1" | sed -nE 's/.*Disk Size:.*\(([0-9]+) Bytes\).*/\1/p' | head -1
+  else lsblk -bdno SIZE "$1"; fi
+}
+dev_proto() {
+  if [ "$OS" = Darwin ]; then mac_field "$1" Protocol
+  else lsblk -dno TRAN "$1" 2>/dev/null | sed 's/^$/-/'; fi
+}
+dev_is_removable() {
+  local proto rem
+  if [ "$OS" = Darwin ]; then
+    proto=$(mac_field "$1" Protocol); rem=$(mac_field "$1" "Removable Media")
+    case "$proto" in *"Secure Digital"*|*USB*) return 0 ;; esac
+    [ "$rem" = "Removable" ]
+  else
+    proto=$(lsblk -dno TRAN "$1" 2>/dev/null); rem=$(lsblk -dno RM "$1" 2>/dev/null)
+    case "$proto" in usb|mmc) return 0 ;; esac
+    case "$1" in /dev/mmcblk*) return 0 ;; esac
+    [ "$rem" = "1" ]
+  fi
+}
+dev_boot() {  # фізичний диск із системою — його ніколи не чіпаємо
+  local whole store src
+  if [ "$OS" = Darwin ]; then
+    whole=$(diskutil info / | sed -nE 's/^ *Part of Whole: +//p' | head -1)
+    store=$(diskutil info "$whole" 2>/dev/null | sed -nE 's/^ *APFS Physical Store( Device)?: +//p' | head -1)
+    [ -n "$store" ] || store="$whole"
+    echo "/dev/${store%%s[0-9]*}"
+  else
+    src=$(findmnt -no SOURCE / 2>/dev/null | sed 's/\[.*//')
+    [ -n "$src" ] && [ -b "$src" ] && echo "/dev/$(lsblk -sno NAME "$src" | tail -1)" || echo ""
+  fi
+}
+dev_partitions() {
+  if [ "$OS" = Darwin ]; then diskutil list "$1" | sed -n '3,$p'
+  else lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT "$1"; fi
+}
+dev_has_fat() {
+  if [ "$OS" = Darwin ]; then diskutil list "$1" | grep -q "FAT"
+  else lsblk -no FSTYPE "$1" | grep -q vfat; fi
+}
+dev_unmount() {
+  local mp
+  if [ "$OS" = Darwin ]; then diskutil unmountDisk "$1" >&2
+  else
+    lsblk -lno MOUNTPOINT "$1" | sed '/^$/d' | while read -r mp; do
+      log "umount $mp"; $(sudo_if_needed /dev/null) umount "$mp" 2>/dev/null || sudo umount "$mp"
+    done
+  fi
+}
+dev_eject() {
+  if [ "$OS" = Darwin ]; then diskutil eject "$1" >&2 || true
+  else sync; command -v udisksctl >/dev/null 2>&1 && udisksctl power-off -b "$1" >/dev/null 2>&1 || true; fi
+}
+guard_target_disk() {  # $1=/dev/disk $2=force(0/1)
+  local boot
+  boot=$(dev_boot)
+  [ -z "$boot" ] || [ "$1" != "$boot" ] || die "$1 — системний диск. Відмова."
+  if ! dev_is_removable "$1"; then
+    [ "$2" = 1 ] || die "$1 не виглядає як знімний носій (протокол: $(dev_proto "$1")). Додайте --force, якщо впевнені."
+    warn "$1 не знімний носій, продовжую через --force"
+  fi
+}
+
+# розділ MBR у файлі: $1=img $2=1..4 -> "type start_sector size_sectors"
+mbr_part() {
+  local base=$((446 + 16 * ($2 - 1)))
+  local type start size
+  type=$(od -An -tu1 -j $((base + 4)) -N 1 "$1" | tr -d ' ')
+  start=$(od -An -tu4 -j $((base + 8)) -N 4 "$1" | tr -d ' ')
+  size=$(od -An -tu4 -j $((base + 12)) -N 4 "$1" | tr -d ' ')
+  echo "${type:-0} ${start:-0} ${size:-0}"
+}
+
+# ---------- list ----------
+cmd_list() {
+  local boot d size proto rem tag
+  boot=$(dev_boot)
+  if [ "$OS" = Darwin ]; then
+    need diskutil
+    diskutil list physical | sed -nE 's|^/dev/(disk[0-9]+).*|/dev/\1|p' | while read -r d; do
+      size=$(mac_field "$d" "Disk Size" | sed -E 's/ \(.*//'); proto=$(mac_field "$d" Protocol); rem=$(mac_field "$d" "Removable Media")
+      tag=""; [ "$d" = "$boot" ] && tag="  <- системний диск, НЕ чіпати"
+      dev_is_removable "$d" && [ "$d" != "$boot" ] && tag="  <- кандидат"
+      printf '%s  %s  %s  %s%s\n' "$d" "$size" "$proto" "$rem" "$tag"
+      dev_partitions "$d" | sed 's/^/      /'
+    done
+  else
+    need lsblk
+    lsblk -dno NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}' | while read -r d; do
+      size=$(lsblk -dno SIZE "$d"); proto=$(dev_proto "$d"); rem=$(lsblk -dno RM "$d")
+      tag=""; [ "$d" = "$boot" ] && tag="  <- системний диск, НЕ чіпати"
+      dev_is_removable "$d" && [ "$d" != "$boot" ] && tag="  <- кандидат"
+      printf '%s  %s  tran=%s  rm=%s  %s%s\n' "$d" "$size" "$proto" "$rem" "$(lsblk -dno MODEL "$d" | sed 's/ *$//')" "$tag"
+      lsblk -no NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT "$d" | sed -n '2,$p' | sed 's/^/      /'
+    done
+  fi
+}
+
+# ---------- backup ----------
+BK_TMP=""; BK_OK=1; BK_OUT=""; BK_OUTDIR=""; BK_NAME=""; BK_RAW=0; BK_RAWFILE=""
+backup_cleanup() {
+  [ -z "$BK_TMP" ] || rm -rf "$BK_TMP"
+  if [ "$BK_OK" = 0 ]; then
+    warn "бекап не завершено, видаляю неповні файли"
+    rm -f "$BK_OUT" "$BK_OUTDIR/$BK_NAME.img.sha256" "$BK_OUTDIR/$BK_NAME.img.xz.sha256"
+    [ "$BK_RAW" = 0 ] || rm -f "$BK_RAWFILE"
+  fi
+}
+cmd_backup() {
+  local src="" outdir="." name="" level=6 threads=0 raw=0 verify=1 force=0 use_stdin=0 size=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o|--out) outdir="$2"; shift 2 ;;
+      -n|--name) name="$2"; shift 2 ;;
+      -l|--level) level="$2"; shift 2 ;;
+      -T|--threads) threads="$2"; shift 2 ;;
+      --raw) raw=1; shift ;;
+      --no-verify) verify=0; shift ;;
+      --force) force=1; shift ;;
+      --stdin) use_stdin=1; shift ;;
+      --size) size="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "невідома опція: $1" ;;
+      *) [ -z "$src" ] || die "зайвий аргумент: $1"; src="$1"; shift ;;
+    esac
+  done
+  [[ "$level" =~ ^[0-9]$ ]] || die "--level має бути 0..9"
+  [[ "$threads" =~ ^[0-9]+$ ]] || die "--threads має бути числом"
+  [ -z "$size" ] || [[ "$size" =~ ^[0-9]+$ ]] || die "--size має бути числом байтів"
+  need xz "brew install xz / apt install xz-utils"; need tee; need od
+  command -v sha256sum >/dev/null 2>&1 || need shasum
+
+  # --- джерело: stdin | файл | диск ---
+  local kind="" dev="" rawdev="" label=""
+  if [ "$use_stdin" = 1 ]; then
+    [ -z "$src" ] || die "--stdin несумісний з аргументом джерела"
+    kind=stdin; label="stdin"
+    [ -n "$size" ] || warn "--size не вказано: повноту потоку перевірити не зможу, лише sha256 архіву проти потоку"
+  elif [ -z "$src" ]; then
+    usage; die "вкажіть диск (див. 'rpi-sd-backup list') або файл .img"
+  elif [ -f "$src" ]; then
+    kind=file; label="$src"; size=$(fsize "$src")
+    [ -n "$name" ] || { name=$(basename "$src"); name="${name%.img}"; }
+  else
+    kind=disk
+    dev=$(dev_norm "$src"); rawdev=$(dev_raw "$dev"); label="$dev"
+    guard_target_disk "$dev" "$force"
+    size=$(dev_size "$dev")
+    [ -n "$size" ] && [ "$size" -gt 0 ] || die "не вдалося визначити розмір $dev"
+    dev_has_fat "$dev" || warn "на $dev немає FAT-розділу, для картки Raspberry Pi це незвично"
+    [ -n "$name" ] || name="rpi-sd-${dev##*/}-$(date +%Y%m%d-%H%M)"
+  fi
+  [ -n "$name" ] || name="rpi-sd-$(date +%Y%m%d-%H%M)"
+
+  mkdir -p "$outdir"
+  local out="$outdir/$name.img.xz" rawfile="$outdir/$name.img"
+  [ ! -e "$out" ] || die "файл уже існує: $out"
+  [ "$raw" = 0 ] || [ ! -e "$rawfile" ] || die "файл уже існує: $rawfile"
+
+  log "Джерело: $label${size:+ ($size байт, $(human "$size"))}"
+  [ "$kind" != disk ] || { log "Протокол: $(dev_proto "$dev")"; dev_partitions "$dev" >&2; }
+  log "Результат: $out (xz -$level, потоки: $threads)"
+
+  local SUDO=""
+  if [ "$kind" = disk ]; then
+    log "Відмонтовую розділи $dev"
+    dev_unmount "$dev"
+    SUDO=$(sudo_if_needed "$rawdev")
+    [ -z "$SUDO" ] || { log "Для читання $rawdev потрібен sudo"; sudo -v; }
+  fi
+
+  # --- конвеєр --- (стан для EXIT-trap у глобальних змінних: локальні в trap уже недоступні)
+  BK_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rpi-sd-backup.XXXXXX")
+  BK_OK=0; BK_OUT="$out"; BK_OUTDIR="$outdir"; BK_NAME="$name"; BK_RAW="$raw"; BK_RAWFILE="$rawfile"
+  trap backup_cleanup EXIT
+
+  # xz — останній у конвеєрі (звичайний pipe): на macOS xz зависає, читаючи з FIFO (вада poll()).
+  # sha256 сирого потоку рахує process substitution і кладе у файл; --raw додає файл до tee.
+  local shafile="$BK_TMP/raw.sha256"
+  local targets=()
+  [ "$raw" = 0 ] || targets+=("$rawfile")
+  local XZ=(xz -T"$threads" -"$level" -c)
+
+  log "Читаю джерело, рахую sha256 і стискаю одним потоком..."
+  local started raw_sha progress
+  started=$(date +%s)
+  progress=$(dd_progress_flag)
+  case "$kind" in
+    disk)
+      # shellcheck disable=SC2086
+      $SUDO dd if="$rawdev" bs="$(dd_bs)" $progress \
+        | tee ${targets[@]+"${targets[@]}"} >(sha256_hex >"$shafile") | "${XZ[@]}" >"$out" ;;
+    file)
+      # shellcheck disable=SC2086
+      dd if="$src" bs="$(dd_bs)" $progress \
+        | tee ${targets[@]+"${targets[@]}"} >(sha256_hex >"$shafile") | "${XZ[@]}" >"$out" ;;
+    stdin)
+      if command -v pv >/dev/null 2>&1 && [ -n "$size" ]; then
+        pv -s "$size" | tee ${targets[@]+"${targets[@]}"} >(sha256_hex >"$shafile") | "${XZ[@]}" >"$out"
+      else
+        tee ${targets[@]+"${targets[@]}"} >(sha256_hex >"$shafile") | "${XZ[@]}" >"$out"
+      fi ;;
+  esac
+  # sha256 завершується одразу після EOF від tee; чекаємо на файл із хешем
+  local i=0
+  until [ -s "$shafile" ]; do i=$((i + 1)); [ "$i" -lt 600 ] || die "не дочекався sha256 сирого потоку"; sleep 0.1; done
+  raw_sha=$(awk '{print $1}' "$shafile")
+  log "Читання і стиснення зайняли $(( $(date +%s) - started )) с"
+
+  local unc
+  unc=$(xz --robot -l "$out" | awk -F'\t' '$1=="file"{print $5}')
+  if [ -n "$size" ]; then
+    [ "$unc" = "$size" ] || die "нестиснутий розмір архіву ($unc) != розмір джерела ($size): образ неповний"
+  else
+    size="$unc"; warn "розмір джерела невідомий, приймаю $unc байт з архіву"
+  fi
+  [ "$raw" = 0 ] || [ "$(fsize "$rawfile")" = "$size" ] || die "розмір $rawfile != розмір джерела"
+
+  printf '%s  %s\n' "$raw_sha" "$name.img" >"$outdir/$name.img.sha256"
+  (cd "$outdir" && sha256_stream <"$name.img.xz" | awk -v f="$name.img.xz" '{print $1"  "f}' >"$name.img.xz.sha256")
+
+  if [ "$verify" = 1 ]; then
+    log "Звірка: розпаковую архів і порівнюю sha256 із сирим потоком..."
+    local got
+    got=$(xz -dc -T"$threads" "$out" | sha256_hex)
+    [ "$got" = "$raw_sha" ] || die "sha256 розпакованого архіву не збігається з прочитаним із джерела"
+    log "Звірка пройшла: розпакований архів побайтово дорівнює джерелу"
+  fi
+  BK_OK=1
+
+  local csize
+  csize=$(fsize "$out")
+  {
+    echo
+    echo "Готово."
+    echo "  Архів:            $out  ($(human "$csize"), коефіцієнт $(awk -v a="$csize" -v b="$size" 'BEGIN{printf "%.3f", a/b}'))"
+    echo "  sha256 архіву:    $outdir/$name.img.xz.sha256"
+    echo "  sha256 сирого:    $outdir/$name.img.sha256  ($raw_sha)"
+    [ "$raw" = 0 ] || echo "  Сирий образ:      $rawfile"
+    [ "$kind" != disk ] || echo "Диск $dev відмонтовано, його можна витягнути."
+    echo "Прошивка: Raspberry Pi Imager -> Choose OS -> Use custom -> цей .img.xz; на OS customisation відповісти No."
+  } >&2
+}
+
+# ---------- verify ----------
+cmd_verify() {
+  local file="${1:-}" rawsha="${2:-}"
+  [ -n "$file" ] || die "вкажіть файл .img.xz"
+  [ -f "$file" ] || die "немає файлу: $file"
+  need xz
+  local dir base
+  dir=$(cd "$(dirname "$file")" && pwd); base=$(basename "$file")
+
+  log "xz -l"; xz -l "$file" >&2
+  log "xz -t (цілісність архіву)"; xz -t "$file" && log "архів цілий"
+
+  if [ -f "$dir/$base.sha256" ]; then
+    log "sha256 архіву за $base.sha256"
+    local want got
+    want=$(awk '{print $1}' "$dir/$base.sha256"); got=$(sha256_hex <"$file")
+    [ "$want" = "$got" ] || die "sha256 архіву не збігається ($got != $want)"
+    log "sha256 архіву збігається"
+  fi
+
+  local expect=""
+  if [ -n "$rawsha" ]; then
+    if [ -f "$rawsha" ]; then expect=$(awk '{print $1}' "$rawsha"); else expect="$rawsha"; fi
+  elif [ -f "$dir/${base%.xz}.sha256" ]; then
+    expect=$(awk '{print $1}' "$dir/${base%.xz}.sha256")
+  fi
+  if [ -n "$expect" ]; then
+    log "Розпаковую і рахую sha256 (це займає час)..."
+    local got
+    got=$(xz -dc -T0 "$file" | sha256_hex)
+    [ "$got" = "$expect" ] || die "sha256 розпакованого ($got) != очікуваний ($expect)"
+    log "sha256 розпакованого збігається: $got"
+  else
+    warn "sha256 сирого образу невідомий (немає ${base%.xz}.sha256), розпакований потік не звіряю"
+  fi
+}
+
+# ---------- inspect ----------
+find_e2fsprogs() {
+  local p
+  for p in /opt/homebrew/opt/e2fsprogs/sbin /usr/local/opt/e2fsprogs/sbin /sbin /usr/sbin; do
+    [ -d "$p" ] && PATH="$PATH:$p"
+  done
+  command -v e2fsck >/dev/null 2>&1 && command -v debugfs >/dev/null 2>&1 \
+    || die "потрібен e2fsprogs (macOS: brew install e2fsprogs; Debian: apt install e2fsprogs)"
+}
+fat_read() {  # $1=img $2=offset_bytes $3=file -> вміст або порожньо
+  if command -v mtype >/dev/null 2>&1; then
+    mtype -i "$1@@$2" "::$3" 2>/dev/null || true
+  fi
+}
+cmd_inspect() {
+  local img="${1:-}"
+  [ -n "$img" ] || die "вкажіть сирий .img (не .xz)"
+  [ -f "$img" ] || die "немає файлу: $img"
+  case "$img" in *.xz) die "inspect працює лише з сирим .img (xz -dk файл.img.xz)";; esac
+  find_e2fsprogs
+  export LC_ALL=C LANG=C
+
+  log "Таблиця розділів (MBR)"
+  local n type start size linux_off="" fat_off=""
+  for n in 1 2 3 4; do
+    read -r type start size <<<"$(mbr_part "$img" "$n")"
+    [ "$size" -gt 0 ] || continue
+    printf '  %d: type=0x%02x start=%d size=%d sectors (%s)\n' "$n" "$type" "$start" "$size" "$(human $((size * 512)))" >&2
+    [ "$type" = 131 ] && [ -z "$linux_off" ] && linux_off=$((start * 512))
+    case "$type" in 11|12|14|6|4|1) [ -n "$fat_off" ] || fat_off=$((start * 512)) ;; esac
+  done
+  [ -n "$linux_off" ] || die "не знайдено Linux-розділ (0x83) у MBR"
+  local FS="$img?offset=$linux_off"
+
+  log "ext4: суперблок (debugfs stats)"
+  local feats hdr
+  # dumpe2fs не приймає 'file?offset=N' (резолвить ім'я через blkid), debugfs приймає
+  hdr=$(debugfs -R "stats -h" "$FS" 2>/dev/null || true)
+  [ -n "$hdr" ] || die "debugfs не зміг прочитати суперблок ext4 за зсувом $linux_off"
+  feats=$(echo "$hdr" | sed -nE 's/^Filesystem features: +//p')
+  echo "$hdr" | grep -E "^(Filesystem volume name|Filesystem state|Block count|Free blocks|Block size|Last mount time|Last write time|Filesystem UUID):" | sed 's/^/  /' >&2 || true
+  case "$feats" in
+    *needs_recovery*) warn "журнал ext4 не закритий (картку вийняли без shutdown). Ядро відтворить його при першому завантаженні; це нормально." ;;
+  esac
+
+  log "ext4: e2fsck -f -n (лише читання; без replay журналу можливі 'помилки')"
+  e2fsck -f -n "$FS" 2>&1 | tail -3 | sed 's/^/  /' >&2 || true
+
+  log "Система (debugfs)"
+  local osr
+  osr=$(debugfs -R "cat /usr/lib/os-release" "$FS" 2>/dev/null | sed -nE 's/^PRETTY_NAME="?([^"]*)"?/\1/p')
+  [ -n "$osr" ] || osr=$(debugfs -R "cat /etc/os-release" "$FS" 2>/dev/null | sed -nE 's/^PRETTY_NAME="?([^"]*)"?/\1/p')
+  printf '  OS:       %s\n  hostname: %s\n' "${osr:-?}" "$(debugfs -R "cat /etc/hostname" "$FS" 2>/dev/null)" >&2
+  debugfs -R "cat /etc/fstab" "$FS" 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' | sed 's/^/  fstab:    /' >&2 || true
+
+  log "Авторозширення root-розділу на більшій картці"
+  local cfg
+  cfg=$(debugfs -R "cat /etc/cloud/cloud.cfg" "$FS" 2>/dev/null || true)
+  if [ -n "$cfg" ]; then
+    if debugfs -R "stat /etc/cloud/cloud-init.disabled" "$FS" 2>&1 | grep -q "File not found"; then
+      if echo "$cfg" | grep -qE '^[[:space:]]*-[[:space:]]*growpart' && echo "$cfg" | grep -qE '^[[:space:]]*-[[:space:]]*resizefs'; then
+        echo "  cloud-init: growpart + resizefs увімкнені -> розділ розшириться сам при завантаженні" >&2
+      else
+        warn "cloud-init є, але growpart/resizefs не в cloud_init_modules: після прошивки 'sudo growpart /dev/mmcblk0 2 && sudo resize2fs /dev/mmcblk0p2'"
+      fi
+    else
+      warn "cloud-init вимкнено (/etc/cloud/cloud-init.disabled): після прошивки 'sudo growpart /dev/mmcblk0 2 && sudo resize2fs /dev/mmcblk0p2'"
+    fi
+  else
+    echo "  cloud-init не знайдено (Raspberry Pi OS?). Після прошивки: 'sudo raspi-config --expand-rootfs' або growpart+resize2fs" >&2
+  fi
+
+  if [ -n "$fat_off" ]; then
+    log "Boot-розділ (FAT)"
+    local cmdline issue
+    if command -v mtype >/dev/null 2>&1; then
+      cmdline=$(fat_read "$img" "$fat_off" cmdline.txt); issue=$(fat_read "$img" "$fat_off" issue.txt | head -1)
+      [ -z "$cmdline" ] || printf '  cmdline.txt: %s\n' "$cmdline" >&2
+      [ -z "$issue" ] || printf '  issue.txt:   %s\n' "$issue" >&2
+      if fat_read "$img" "$fat_off" user-data | grep -q .; then echo "  user-data:   є (cloud-init NoCloud seed)" >&2; fi
+      [ -n "$cmdline$issue" ] || warn "не вдалося прочитати файли з FAT (mtools)"
+    elif [ "$OS" = Darwin ] && command -v hdiutil >/dev/null 2>&1; then
+      local dev mnt
+      dev=$(hdiutil attach -readonly -imagekey diskimage-class=CRawDiskImage "$img" 2>/dev/null | awk '/FAT|DOS/ {print $1; exit}')
+      if [ -n "$dev" ]; then
+        mnt=$(diskutil info "$dev" | sed -nE 's/^ *Mount Point: +//p')
+        [ -f "$mnt/cmdline.txt" ] && printf '  cmdline.txt: %s\n' "$(cat "$mnt/cmdline.txt")" >&2
+        [ -f "$mnt/issue.txt" ] && printf '  issue.txt:   %s\n' "$(head -1 "$mnt/issue.txt")" >&2
+        [ -f "$mnt/user-data" ] && echo "  user-data:   є (cloud-init NoCloud seed)" >&2
+        hdiutil detach "${dev%s[0-9]*}" >/dev/null 2>&1 || hdiutil detach "$dev" >/dev/null 2>&1 || true
+      else
+        warn "не вдалося підключити FAT-розділ образу"
+      fi
+    else
+      warn "для читання FAT-розділу потрібен mtools (brew/apt install mtools)"
+    fi
+  fi
+}
+
+# ---------- restore ----------
+cmd_restore() {
+  local file="" disk="" force=0 to_stdout=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --stdout) to_stdout=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "невідома опція: $1" ;;
+      *) if [ -z "$file" ]; then file="$1"; elif [ -z "$disk" ]; then disk="$1"; else die "зайвий аргумент: $1"; fi; shift ;;
+    esac
+  done
+  [ -n "$file" ] || die "використання: rpi-sd-backup restore <file.img[.xz]> <disk>  |  restore --stdout <file>"
+  [ -f "$file" ] || die "немає файлу: $file"
+  need xz
+
+  if [ "$to_stdout" = 1 ]; then
+    [ -z "$disk" ] || die "--stdout несумісний з диском"
+    [ ! -t 1 ] || die "--stdout: stdout — термінал; перенаправте у dd"
+    case "$file" in *.xz) exec xz -dc -T0 "$file" ;; *) exec cat "$file" ;; esac
+  fi
+  [ -n "$disk" ] || die "вкажіть диск призначення"
+
+  local dev rawdev size unc
+  dev=$(dev_norm "$disk"); rawdev=$(dev_raw "$dev")
+  guard_target_disk "$dev" "$force"
+  size=$(dev_size "$dev")
+  case "$file" in
+    *.xz) unc=$(xz --robot -l "$file" | awk -F'\t' '$1=="file"{print $5}') ;;
+    *) unc=$(fsize "$file") ;;
+  esac
+  [ "$unc" -le "$size" ] || die "образ ($unc байт) більший за диск $dev ($size байт)"
+
+  log "ЦІЛЬ: $dev ($(dev_proto "$dev"), $(human "$size")). УСІ ДАНІ НА НЬОМУ БУДЕ ЗНИЩЕНО."
+  dev_partitions "$dev" >&2
+  printf 'Для підтвердження введіть ідентифікатор диска (%s): ' "${dev##*/}" >&2
+  local answer; read -r answer
+  [ "$answer" = "${dev##*/}" ] || die "скасовано"
+
+  dev_unmount "$dev"
+  local SUDO; SUDO=$(sudo_if_needed "$rawdev"); [ -z "$SUDO" ] || sudo -v
+  log "Записую $file -> $rawdev"
+  local progress; progress=$(dd_progress_flag)
+  case "$file" in
+    # shellcheck disable=SC2086
+    *.xz) xz -dc -T0 "$file" | $SUDO dd of="$rawdev" bs="$(dd_bs)" $progress ;;
+    # shellcheck disable=SC2086
+    *) $SUDO dd if="$file" of="$rawdev" bs="$(dd_bs)" $progress ;;
+  esac
+  sync
+  log "Запис завершено, виймаю диск"
+  dev_eject "$dev"
+  echo "Готово. На більшій картці root-розділ розшириться сам (cloud-init) або: sudo growpart /dev/mmcblk0 2 && sudo resize2fs /dev/mmcblk0p2" >&2
+}
+
+# ---------- main ----------
+main() {
+  case "$OS" in Darwin|Linux) ;; *) die "підтримуються macOS і Linux (для інших ОС — rpi-sd-backup-docker)" ;; esac
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    list) cmd_list "$@" ;;
+    backup) cmd_backup "$@" ;;
+    verify) cmd_verify "$@" ;;
+    inspect) cmd_inspect "$@" ;;
+    restore) cmd_restore "$@" ;;
+    -V|--version) echo "rpi-sd-backup $VERSION" ;;
+    ""|-h|--help|help) usage ;;
+    *) usage; die "невідома команда: $cmd" ;;
+  esac
+}
+
+# rpi-sd-backup-docker підключає цей файл як бібліотеку (RPI_SD_BACKUP_LIB=1)
+[ "${RPI_SD_BACKUP_LIB:-0}" = 1 ] || main "$@"

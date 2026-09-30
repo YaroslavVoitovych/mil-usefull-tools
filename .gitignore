@@ -1,0 +1,9 @@
+# образи дисків та їх хеші ніколи не комітимо
+*.img
+*.img.xz
+*.img.gz
+*.img.zst
+*.sha256
+
+# macOS
+.DS_Store
