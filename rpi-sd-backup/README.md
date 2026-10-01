@@ -32,7 +32,7 @@ rpi-sd-backup list                                       знімні диски
 rpi-sd-backup backup  <disk|file.img> [опції]            повний образ -> NAME.img.xz (+ sha256, звірка)
 rpi-sd-backup verify  <file.img.xz> [raw.sha256|hex]     перевірити архів
 rpi-sd-backup inspect <file.img>                         стан ext4, cloud-init, cmdline.txt у сирому образі
-rpi-sd-backup restore <file.img[.xz]> <disk>             записати образ на картку через dd
+rpi-sd-backup restore <file.img[.xz]> <disk> [опції]     записати образ на картку через dd (+ опційно розділ даних)
 ```
 
 `<disk>`: macOS — `disk5` або `/dev/disk5`; Linux — `/dev/sdb`, `/dev/mmcblk0` (цілий диск, не розділ).
@@ -51,6 +51,16 @@ rpi-sd-backup restore <file.img[.xz]> <disk>             записати обр
 | `--no-verify` | не розпаковувати архів для звірки (економить 1–3 хв) |
 | `--force` | дозволити не знімний диск (напр. образ, підключений через hdiutil) |
 | `--stdin --size N` | джерело — stdin (так працює Docker-обгортка) |
+
+Опції `restore`:
+
+| Опція | Значення |
+|-------|----------|
+| `--data-part NG` | після запису додати в кінець картки розділ 3 (Linux, ext4) на N GiB; root виросте до його початку сам на першому завантаженні (див. нижче) |
+| `--data-label L` | мітка ФС розділу даних (типово `recordings`) |
+| `--data-owner U:G` | числові UID:GID власника кореня розділу даних (типово `0:0`) |
+| `--force` | дозволити не знімний диск (напр. образ, підключений через hdiutil) |
+| `--stdout` | не писати на диск, а віддати розпакований потік у stdout (так працює Docker-обгортка) |
 
 ### Типовий сценарій
 
@@ -121,6 +131,57 @@ docker run --rm -v "${PWD}:/work" rpi-sd-backup:local inspect /work/card.img
 
 `rpi-sd-backup inspect file.img` показує, який із цих випадків у вас (потрібен сирий `.img`:
 `xz -dk file.img.xz`).
+
+## Більша картка: окремий розділ даних (`--data-part`)
+
+Для систем, що пишуть дані (відео, логи) безперервно, краще тримати їх на окремому розділі: переповнення
+чи пошкодження цієї ФС не торкається root. `restore --data-part` робить це з хоста, без жодних дій на Pi:
+
+```bash
+rpi-sd-backup restore image.img.xz disk5 --data-part 100G --data-label recordings --data-owner 997:984
+```
+
+Що відбувається (усе на цілому диску за зсувом, картку не треба виймати між кроками):
+
+1. Образ записується як звичайно.
+2. У MBR додається запис 3: Linux (0x83), рівно N GiB, вирівняний на 1 MiB, **у кінці картки**. План
+   і помилки (немає `mke2fs`, не вміщається) показуються до підтвердження, а не після 10 хв запису.
+3. `mke2fs -t ext4 -E offset=...,root_owner=U:G -m 0` створює ФС на цьому розділі; мітка читається назад для контролю.
+   Після кожного запису на цілий диск ОС перечитує таблицю і macOS за секунду сам монтує FAT-розділ,
+   від чого диск стає «busy»; тому запис MBR і `mke2fs` виконуються як «відмонтувати → спробувати →
+   при busy повторити». Якщо `mke2fs` усе ж не вдасться, образ і MBR уже на картці, а повідомлення
+   про помилку містить готову команду для ручного завершення.
+4. На першому завантаженні cloud-init `growpart` розтягує root (розділ 2) до початку розділу 3,
+   тобто root отримує «решту», а розділ даних — рівно N GiB.
+
+Вимоги: `mke2fs` на хості (macOS: `brew install e2fsprogs`), образ з MBR, де розділ 2 — Linux, а
+записи 3 і 4 порожні. Монтування розділу даних має бути **вже в `/etc/fstab` образу**: інструмент
+не чіпає вміст root-ФС. Рекомендований рядок (порядок відносно сервісу-споживача гарантує
+`x-systemd.before`, бо з `nofail` монтування не впорядковане перед `local-fs.target`; `nofail`
+лишає завантаження і резервний запис на root, якщо розділу немає, напр. на меншій картці):
+
+```
+LABEL=recordings  /home/recordings  ext4  defaults,noatime,nofail,x-systemd.device-timeout=10s,x-systemd.before=my-service.service  0  2
+```
+
+Як одноразово вписати цей рядок у наявний образ на macOS без Linux (ext4 не монтується, але
+e2fsprogs уміє редагувати ФС напряму). Нюанси: e2fsck не може зробити replay журналу через
+`file?offset=N` і не може писати у raw `/dev/rdiskN` (невирівняний запис суперблоку), тому
+працюємо через буферизований `/dev/diskNsM`:
+
+```bash
+E2=/opt/homebrew/opt/e2fsprogs/sbin
+cp -c orig.img new.img                                      # APFS-клон, миттєво, оригінал не чіпаємо
+hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage new.img      # -> /dev/diskN
+$E2/e2fsck -f -p /dev/diskNs2                               # replay журналу + повна перевірка
+$E2/debugfs -R "cat /etc/fstab" /dev/diskNs2 > fstab.new && echo 'LABEL=recordings ...' >> fstab.new
+printf 'rm /etc/fstab\nwrite fstab.new /etc/fstab\nsif /etc/fstab mode 0100644\nsif /etc/fstab uid 0\nsif /etc/fstab gid 0\n' \
+    | $E2/debugfs -w /dev/diskNs2
+$E2/e2fsck -fn /dev/diskNs2 && hdiutil detach /dev/diskN   # має бути exit 0
+rpi-sd-backup backup new.img -o . -n image-v2               # -> image-v2.img.xz + sha256
+```
+
+У Docker-обгортці `--data-part` не підтримується (контейнер не бачить картку, а `mke2fs` потрібен на хості).
 
 ## Незакритий журнал ext4
 

@@ -125,6 +125,7 @@ cmd_restore_docker() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --force) force=1; shift ;;
+      --data-part|--data-label|--data-owner) die "$1 підтримується лише нативним rpi-sd-backup restore (потрібен mke2fs на хості)" ;;
       -h|--help) usage; exit 0 ;;
       -*) die "невідома опція: $1" ;;
       *) if [ -z "$file" ]; then file="$1"; elif [ -z "$disk" ]; then disk="$1"; else die "зайвий аргумент: $1"; fi; shift ;;

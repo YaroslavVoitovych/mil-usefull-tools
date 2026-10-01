@@ -4,7 +4,7 @@
 
 | Інструмент | Призначення | Запуск |
 |------------|-------------|--------|
-| [rpi-sd-backup](rpi-sd-backup/) | Бекап SD-картки Raspberry Pi одним файлом `.img.xz` для Raspberry Pi Imager: читання, стиснення, звірка, огляд образу, відновлення | нативно (macOS/Linux) або через Docker (`rpi-sd-backup-docker`) |
+| [rpi-sd-backup](rpi-sd-backup/) | Бекап SD-картки Raspberry Pi одним файлом `.img.xz` для Raspberry Pi Imager: читання, стиснення, звірка, огляд образу, відновлення (на більшу картку — з окремим розділом даних, `--data-part`) | нативно (macOS/Linux) або через Docker (`rpi-sd-backup-docker`) |
 
 ## Встановлення
 

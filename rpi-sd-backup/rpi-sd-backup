@@ -35,7 +35,7 @@ rpi-sd-backup — бекап SD-картки Raspberry Pi одним файло�
   rpi-sd-backup backup  --stdin --size BYTES [опції]       те саме, але джерело — stdin (режим Docker)
   rpi-sd-backup verify  <file.img.xz> [raw.sha256|hex]     перевірити архів: xz -t, sha256 архіву, sha256 розпакованого
   rpi-sd-backup inspect <file.img>                         стан ext4, cloud-init, cmdline.txt у сирому образі
-  rpi-sd-backup restore <file.img[.xz]> <disk>             записати образ на картку через dd (альтернатива Imager)
+  rpi-sd-backup restore <file.img[.xz]> <disk> [опції]     записати образ на картку через dd (альтернатива Imager)
   rpi-sd-backup restore --stdout <file.img[.xz]>           віддати розпакований образ у stdout (режим Docker)
 
 <disk>: macOS — disk5 / /dev/disk5; Linux — sdb / /dev/sdb / mmcblk0 (цілий диск, не розділ).
@@ -54,6 +54,11 @@ rpi-sd-backup — бекап SD-картки Raspberry Pi одним файло�
 Опції restore:
       --force          не вимагати, щоб диск був знімним (SD/USB)
       --stdout         не писати на диск, а віддати розпакований потік у stdout
+      --data-part NG   після запису додати в КІНЕЦЬ картки розділ 3 (Linux, ext4) на N GiB, напр. 100G.
+                       Root (розділ 2) на першому завантаженні виросте до його початку (cloud-init growpart).
+                       Потрібен mke2fs (e2fsprogs) на хості. Монтування розділу має бути вже в /etc/fstab образу.
+      --data-label L   мітка ФС розділу даних (типово recordings)
+      --data-owner U:G числові UID:GID власника кореня розділу даних (типово 0:0)
 
 Загальні: -h, --help    -V, --version
 
@@ -63,6 +68,7 @@ rpi-sd-backup — бекап SD-картки Raspberry Pi одним файло�
   sudo rpi-sd-backup backup /dev/sdb -o ~/rpi-backup                           # Linux
   rpi-sd-backup verify ~/rpi-backup/rpi5-ubuntu-user-desktop.img.xz
   rpi-sd-backup inspect ~/rpi-backup/rpi5-ubuntu-user-desktop.img
+  rpi-sd-backup restore ~/rpi-backup/rpi5-ubuntu-user-desktop.img.xz disk5 --data-part 100G --data-owner 997:984
 EOF
 }
 
@@ -480,23 +486,114 @@ cmd_inspect() {
 }
 
 # ---------- restore ----------
+# --data-part: після запису образу додати в кінець картки розділ 3 (Linux 0x83) з ext4.
+# Проміжок між розділом 2 і новим розділом на першому завантаженні забирає cloud-init
+# growpart, тож root росте рівно до початку розділу даних. Усе робиться на цілому диску
+# за зсувом (MBR — один сектор, mke2fs -E offset), тому ОС хоста не мусить перечитувати
+# таблицю розділів і картку не треба виймати між кроками.
+parse_gib() {  # "100G" | "100GiB" | "100" -> секторів (GiB * 2^21)
+  local v="$1"
+  v="${v%GiB}"; v="${v%G}"; v="${v%g}"
+  [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -gt 0 ] || die "--data-part: очікую розмір у GiB, напр. 100G (отримано: $1)"
+  echo $((v * 2097152))
+}
+find_mke2fs() {
+  local p
+  for p in /opt/homebrew/opt/e2fsprogs/sbin /usr/local/opt/e2fsprogs/sbin /sbin /usr/sbin; do
+    [ -d "$p" ] && PATH="$PATH:$p"
+  done
+  command -v mke2fs >/dev/null 2>&1 || die "для --data-part потрібен mke2fs (macOS: brew install e2fsprogs; Debian: apt install e2fsprogs)"
+}
+le32_bin() {  # число -> 4 байти little-endian у stdout
+  local v=$1 i s=""
+  for i in 0 1 2 3; do s="$s\\$(printf '%03o' $(( (v >> (8 * i)) & 255 )))"; done
+  # shellcheck disable=SC2059
+  printf "$s"
+}
+# План розділу даних: $1=файл з MBR образу $2=розмір диска в байтах $3=секторів під дані
+# -> "p2_start p2_end start size" (сектори) або die
+plan_data_part() {
+  local mbr="$1" total=$(( $2 / 512 )) want="$3"
+  local t2 s2 n2 t3 s3 n3 t4 s4 n4 start
+  read -r t2 s2 n2 <<<"$(mbr_part "$mbr" 2)"
+  read -r t3 s3 n3 <<<"$(mbr_part "$mbr" 3)"
+  read -r t4 s4 n4 <<<"$(mbr_part "$mbr" 4)"
+  [ "$t2" = 131 ] && [ "$n2" -gt 0 ] || die "--data-part: розділ 2 образу не Linux (0x83); не знаю, за яким розділом ставити дані"
+  [ "$n3" = 0 ] && [ "$n4" = 0 ] || die "--data-part: в образі вже є розділ 3 або 4"
+  [ "$total" -lt 4294967296 ] || die "--data-part: диск понад 2 TiB, MBR цього не адресує"
+  start=$(( (total - want) / 2048 * 2048 ))   # вирівнювання 1 MiB
+  [ "$start" -ge $((s2 + n2)) ] || die "--data-part: не вміщається: розділ 2 закінчується на секторі $((s2 + n2)), розділ даних мав би початись на $start. Максимум для цієї картки: $(( (total - s2 - n2) / 2097152 )) GiB"
+  echo "$s2 $((s2 + n2)) $start $((total - start))"
+}
+mbr_set_part3() {  # $1=файл MBR $2=start $3=size (сектори): записати запис 3 і перевірити
+  { printf '\000\376\377\377\203\376\377\377'; le32_bin "$2"; le32_bin "$3"; } \
+    | dd of="$1" bs=1 seek=478 count=16 conv=notrunc 2>/dev/null
+  local t s n; read -r t s n <<<"$(mbr_part "$1" 3)"
+  [ "$t" = 131 ] && [ "$s" = "$2" ] && [ "$n" = "$3" ] || die "внутрішня помилка: запис 3 у MBR після правки не збігається (type=$t start=$s size=$n)"
+}
+# Після кожного запису на цілий диск ОС перечитує таблицю розділів і може автоматично примонтувати
+# FAT-розділ (macOS робить це приблизно за секунду), після чого відкриття диска на запис дає
+# "Resource busy". Тому операції запису виконуються так: відмонтувати -> спробувати -> при busy
+# зачекати і повторити. Команда має бути безпечною для повтору (dd одного сектора, mke2fs).
+run_unmounted() {  # $1=dev, далі — команда
+  local dev="$1" i out=""; shift
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    dev_unmount "$dev" >/dev/null 2>&1 || true
+    if out=$("$@" 2>&1); then return 0; fi
+    case "$out" in *[Bb]usy*|*зайнят*) sleep 1 ;; *) printf '%s\n' "$out" >&2; return 1 ;; esac
+  done
+  printf '%s\n' "$out" >&2
+  return 1
+}
+add_data_part() {  # $1=dev $2=rawdev $3=SUDO $4=MBR образу $5=start $6=size $7=label $8=uid:gid
+  local dev="$1" rawdev="$2" SUDO="$3" img_mbr="$4" start="$5" dsize="$6" label="$7" owner="$8"
+  local card_mbr vol mkfs_cmd
+  card_mbr=$(mktemp "${TMPDIR:-/tmp}/rpi-sd-mbr.XXXXXX")
+  sleep 2   # дати ОС перечитати таблицю після dd (і примонтувати, що хоче) до того, як ми відмонтуємо
+  log "Розділ 3: $label, $(human $((dsize * 512))), сектори $start..$((start + dsize - 1))"
+  # shellcheck disable=SC2086
+  $SUDO dd if="$rawdev" bs=512 count=1 2>/dev/null > "$card_mbr"
+  cmp -s "$card_mbr" "$img_mbr" || die "MBR на $rawdev не збігається з MBR образу після запису; розділ даних не створено"
+  mbr_set_part3 "$card_mbr" "$start" "$dsize"
+  # shellcheck disable=SC2086
+  run_unmounted "$dev" $SUDO dd if="$card_mbr" of="$rawdev" bs=512 count=1 conv=notrunc \
+    || die "не вдалося записати MBR на $rawdev (диск зайнятий: ОС тримає примонтований розділ)"
+  sync
+  log "ext4 на розділі 3 (mke2fs за зсувом $((start * 512)))"
+  mkfs_cmd="mke2fs -t ext4 -F -q -L $label -m 0 -E offset=$((start * 512)),root_owner=$owner $rawdev $((dsize / 2))K"
+  # shellcheck disable=SC2086
+  run_unmounted "$dev" $SUDO $mkfs_cmd \
+    || die "mke2fs не вдався. Образ і MBR уже на картці; щоб завершити вручну, відмонтуйте розділи $dev і виконайте: sudo $mkfs_cmd"
+  sync
+  if command -v debugfs >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    vol=$($SUDO debugfs -R "stats -h" "$rawdev?offset=$((start * 512))" 2>/dev/null | sed -nE 's/^Filesystem volume name: +//p')
+    [ "$vol" = "$label" ] || warn "не вдалося прочитати мітку нової ФС назад (отримано: '$vol')"
+  fi
+  rm -f "$card_mbr"
+}
+
 cmd_restore() {
-  local file="" disk="" force=0 to_stdout=0
+  local file="" disk="" force=0 to_stdout=0 data_part="" data_label="recordings" data_owner="0:0"
   while [ $# -gt 0 ]; do
     case "$1" in
       --force) force=1; shift ;;
       --stdout) to_stdout=1; shift ;;
+      --data-part) [ $# -ge 2 ] || die "--data-part потребує розмір, напр. 100G"; data_part="$2"; shift 2 ;;
+      --data-label) [ $# -ge 2 ] || die "--data-label потребує мітку"; data_label="$2"; shift 2 ;;
+      --data-owner) [ $# -ge 2 ] || die "--data-owner потребує UID:GID"; data_owner="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       -*) die "невідома опція: $1" ;;
       *) if [ -z "$file" ]; then file="$1"; elif [ -z "$disk" ]; then disk="$1"; else die "зайвий аргумент: $1"; fi; shift ;;
     esac
   done
-  [ -n "$file" ] || die "використання: rpi-sd-backup restore <file.img[.xz]> <disk>  |  restore --stdout <file>"
+  [ -n "$file" ] || die "використання: rpi-sd-backup restore <file.img[.xz]> <disk> [--data-part NG]  |  restore --stdout <file>"
   [ -f "$file" ] || die "немає файлу: $file"
   need xz
 
   if [ "$to_stdout" = 1 ]; then
     [ -z "$disk" ] || die "--stdout несумісний з диском"
+    [ -z "$data_part" ] || die "--stdout несумісний з --data-part"
     [ ! -t 1 ] || die "--stdout: stdout — термінал; перенаправте у dd"
     case "$file" in *.xz) exec xz -dc -T0 "$file" ;; *) exec cat "$file" ;; esac
   fi
@@ -512,8 +609,28 @@ cmd_restore() {
   esac
   [ "$unc" -le "$size" ] || die "образ ($unc байт) більший за диск $dev ($size байт)"
 
+  # план розділу даних — до підтвердження, щоб помилки (немає mke2fs, не вміщається) не були після 10 хв запису
+  local data_sectors="" img_mbr="" plan p2_start p2_end dstart dsize
+  if [ -n "$data_part" ]; then
+    data_sectors=$(parse_gib "$data_part")
+    [[ "$data_owner" =~ ^[0-9]+:[0-9]+$ ]] || die "--data-owner: очікую числові UID:GID, напр. 997:984"
+    [[ "$data_label" =~ ^[A-Za-z0-9._-]{1,16}$ ]] || die "--data-label: до 16 символів з [A-Za-z0-9._-]"
+    find_mke2fs
+    img_mbr=$(mktemp "${TMPDIR:-/tmp}/rpi-sd-mbr.XXXXXX")
+    case "$file" in
+      *.xz) { xz -dc "$file" 2>/dev/null || true; } | head -c 512 > "$img_mbr" ;;
+      *) head -c 512 "$file" > "$img_mbr" ;;
+    esac
+    [ "$(fsize "$img_mbr")" = 512 ] || die "не вдалося прочитати MBR з $file"
+    plan=$(plan_data_part "$img_mbr" "$size" "$data_sectors")
+    read -r p2_start p2_end dstart dsize <<<"$plan"
+  fi
+
   log "ЦІЛЬ: $dev ($(dev_proto "$dev"), $(human "$size")). УСІ ДАНІ НА НЬОМУ БУДЕ ЗНИЩЕНО."
   dev_partitions "$dev" >&2
+  if [ -n "$data_part" ]; then
+    log "Після запису: розділ 3 '$data_label' ext4 $(human $((dsize * 512))) (власник $data_owner); root виросте на першому завантаженні з $(human $(( (p2_end - p2_start) * 512 ))) до $(human $(( (dstart - p2_start) * 512 )))"
+  fi
   printf 'Для підтвердження введіть ідентифікатор диска (%s): ' "${dev##*/}" >&2
   local answer; read -r answer
   [ "$answer" = "${dev##*/}" ] || die "скасовано"
@@ -529,9 +646,17 @@ cmd_restore() {
     *) $SUDO dd if="$file" of="$rawdev" bs="$(dd_bs)" $progress ;;
   esac
   sync
+  if [ -n "$data_part" ]; then
+    add_data_part "$dev" "$rawdev" "$SUDO" "$img_mbr" "$dstart" "$dsize" "$data_label" "$data_owner"
+    rm -f "$img_mbr"
+  fi
   log "Запис завершено, виймаю диск"
   dev_eject "$dev"
-  echo "Готово. На більшій картці root-розділ розшириться сам (cloud-init) або: sudo growpart /dev/mmcblk0 2 && sudo resize2fs /dev/mmcblk0p2" >&2
+  if [ -n "$data_part" ]; then
+    echo "Готово. Розділ 3 '$data_label' ($(human $((dsize * 512)))) створено; root виросте до нього сам на першому завантаженні (cloud-init growpart). Монтування — за /etc/fstab образу." >&2
+  else
+    echo "Готово. На більшій картці root-розділ розшириться сам (cloud-init) або: sudo growpart /dev/mmcblk0 2 && sudo resize2fs /dev/mmcblk0p2" >&2
+  fi
 }
 
 # ---------- main ----------
